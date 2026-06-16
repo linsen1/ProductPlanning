@@ -3,6 +3,7 @@ AI 策划智能体 - 配置管理
 一期聚焦：产品策划方案
 """
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -10,31 +11,53 @@ from dotenv import load_dotenv
 _ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH, override=True)
 
+
+def _env_value(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = str(value).strip().strip('"').strip("'")
+    value = re.sub(r"\s+#.*$", "", value).strip()
+    return value or default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = _env_value(name, str(default))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    value = _env_value(name, "1" if default else "0").lower()
+    return value not in ("0", "false", "no", "off")
+
 # ── 模型配置 ──────────────────────────────────────────────────────────────────
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
-QWEN_MODEL        = os.getenv("QWEN_MODEL", "qwen-plus")
-EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL", "text-embedding-v4")
+DASHSCOPE_API_KEY = _env_value("DASHSCOPE_API_KEY")
+QWEN_MODEL        = _env_value("QWEN_MODEL", "qwen-plus")
+EMBEDDING_MODEL   = _env_value("EMBEDDING_MODEL", "text-embedding-v4")
 QWEN_BASE_URL     = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_API_KEY = _env_value("OPENAI_API_KEY")
+OPENAI_MODEL   = _env_value("OPENAI_MODEL", "gpt-4o")
 
-LLM_BACKEND = os.getenv("LLM_BACKEND", "qwen")
+LLM_BACKEND = _env_value("LLM_BACKEND", "qwen")
 
 # ── 博查搜索配置 ──────────────────────────────────────────────────────────────
 # 博查全部从 .env 读取，代码中不再硬编码 key
-BOCHA_API_KEY = os.getenv("BOCHA_API_KEY", "")
-BOCHA_API_URL = os.getenv("BOCHA_API_URL", "https://api.bochaai.com/v1/web-search")
-BOCHA_AISEARCH_URL = os.getenv("BOCHA_AISEARCH_URL", "https://api.bochaai.com/v1/ai-search")
-BOCHA_SEARCH_COUNT = int(os.getenv("BOCHA_SEARCH_COUNT", "10"))  # 每次搜索返回结果数（博查上限50）
-BOCHA_FRESHNESS = os.getenv("BOCHA_FRESHNESS", "noLimit")  # oneDay/oneWeek/oneMonth/oneYear/noLimit
+BOCHA_API_KEY = _env_value("BOCHA_API_KEY")
+BOCHA_API_URL = _env_value("BOCHA_API_URL", "https://api.bochaai.com/v1/web-search")
+BOCHA_AISEARCH_URL = _env_value("BOCHA_AISEARCH_URL", "https://api.bochaai.com/v1/ai-search")
+BOCHA_SEARCH_COUNT = _env_int("BOCHA_SEARCH_COUNT", 10)  # 每次搜索返回结果数（博查上限50）
+BOCHA_FRESHNESS = _env_value("BOCHA_FRESHNESS", "noLimit")  # oneDay/oneWeek/oneMonth/oneYear/noLimit
 # 竞品分析是否走 AI 搜索（返回综合长答案，深度更高）；其它检索仍走 web-search
-BOCHA_USE_AISEARCH = os.getenv("BOCHA_USE_AISEARCH", "1") not in ("0", "false", "False", "no")
+BOCHA_USE_AISEARCH = _env_bool("BOCHA_USE_AISEARCH")
 
 # ── 知识库配置 ────────────────────────────────────────────────────────────────
-DB_DIR = os.getenv("VECTOR_DB_DIR", "./chroma_db")
-KB_DIR = os.getenv("KB_DIR", "./data")
-TOP_K  = int(os.getenv("TOP_K", "3"))
+DB_DIR = _env_value("VECTOR_DB_DIR", "./chroma_db")
+KB_DIR = _env_value("KB_DIR", "./data")
+TOP_K  = _env_int("TOP_K", 3)
 
 # ── 一期：项目类型（对应模版人群分类维度）────────────────────────────────────
 PROJECT_TYPES = [
