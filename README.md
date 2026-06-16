@@ -37,6 +37,20 @@ streamlit run app.py
 
 浏览器访问 http://localhost:8501
 
+## 云端部署
+
+如果部署到 Streamlit Community Cloud，建议在 **Advanced settings → Python version** 选择 `3.12`，入口文件选择 `app.py`。如果已经创建了应用但误选了 Python 3.14，需要删除应用后重新部署，部署时再选择 Python 3.12。
+
+Secrets / 环境变量至少需要配置：
+
+```toml
+LLM_BACKEND = "qwen"
+DASHSCOPE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+BOCHA_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+QWEN_MODEL = "qwen3-235b-a22b"
+EMBEDDING_MODEL = "text-embedding-v4"
+```
+
 ## 知识库管理
 
 知识库已按 7 层重构（详见 `data/README_知识库结构.md`），所有 `.md` 进入 RAG：

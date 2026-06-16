@@ -11,6 +11,11 @@ import requests
 from pathlib import Path
 from typing import Dict, List, TypedDict, Optional
 
+# Some cloud images can resolve an old opentelemetry-proto package with a
+# newer protobuf runtime before Chroma imports. Use the pure-Python fallback so
+# the app can still start while requirements keep the dependency stack aligned.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path as _Path
