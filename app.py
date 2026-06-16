@@ -4,9 +4,12 @@ AI 策划智能体 — 一期：产品策划方案（两段式）
 流程：填表 → 博查搜竞品 → AI给USP方向 → 策划人选方向 → AI生成完整方案
 """
 from __future__ import annotations
+import hashlib
 import io
+import math
 import os
 import json
+import re
 import requests
 from pathlib import Path
 from typing import Dict, List, TypedDict, Optional
@@ -20,6 +23,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path as _Path
 from dotenv import load_dotenv
+from langchain_core.embeddings import Embeddings
 from langgraph.graph import StateGraph, END
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -59,12 +63,101 @@ def get_agno_model(temperature: float = 0.5) -> DashScope:
         enable_thinking=False,
     )
 
-def get_embeddings() -> OpenAIEmbeddings:
-    return OpenAIEmbeddings(
+_embedding_fallback_warning_shown = False
+
+
+class LocalHashEmbeddings(Embeddings):
+    """Deterministic local fallback used when remote embedding access is denied."""
+
+    def __init__(self, dimensions: int = 1024):
+        self.dimensions = dimensions
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return [self._embed(text) for text in texts]
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embed(text)
+
+    def _embed(self, text: str) -> List[float]:
+        vec = [0.0] * self.dimensions
+        tokens = self._tokens(text or "")
+        if not tokens:
+            return vec
+        for token, weight in tokens:
+            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+            idx = int.from_bytes(digest[:4], "big") % self.dimensions
+            sign = 1.0 if digest[4] & 1 else -1.0
+            vec[idx] += sign * weight
+        norm = math.sqrt(sum(v * v for v in vec))
+        if not norm:
+            return vec
+        return [v / norm for v in vec]
+
+    @staticmethod
+    def _tokens(text: str) -> List[tuple[str, float]]:
+        lowered = text.lower()
+        tokens: List[tuple[str, float]] = []
+        tokens.extend((m.group(0), 1.0) for m in re.finditer(r"[a-z0-9]+|[\u4e00-\u9fff]", lowered))
+        compact = re.sub(r"\s+", "", lowered)
+        chars = [c for c in compact if c.strip()]
+        for n, weight in ((2, 1.5), (3, 1.2)):
+            if len(chars) >= n:
+                tokens.extend(("".join(chars[i:i + n]), weight) for i in range(len(chars) - n + 1))
+        return tokens
+
+
+class ResilientEmbeddings(Embeddings):
+    def __init__(self, remote: Embeddings, fallback: Embeddings, model_name: str):
+        self.remote = remote
+        self.fallback = fallback
+        self.model_name = model_name
+        self.remote_disabled = False
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if self.remote_disabled:
+            return self.fallback.embed_documents(texts)
+        try:
+            return self.remote.embed_documents(texts)
+        except Exception as exc:
+            self.remote_disabled = True
+            _warn_embedding_fallback(exc, self.model_name)
+            return self.fallback.embed_documents(texts)
+
+    def embed_query(self, text: str) -> List[float]:
+        if self.remote_disabled:
+            return self.fallback.embed_query(text)
+        try:
+            return self.remote.embed_query(text)
+        except Exception as exc:
+            self.remote_disabled = True
+            _warn_embedding_fallback(exc, self.model_name)
+            return self.fallback.embed_query(text)
+
+
+def _warn_embedding_fallback(exc: Exception, model_name: str) -> None:
+    global _embedding_fallback_warning_shown
+    if _embedding_fallback_warning_shown:
+        return
+    _embedding_fallback_warning_shown = True
+    msg = str(exc)
+    if len(msg) > 220:
+        msg = msg[:220] + "..."
+    st.warning(
+        f"DashScope embedding 模型 `{model_name}` 暂不可用，已自动切换到本地知识库向量。"
+        f"原始错误：{msg}"
+    )
+
+
+def get_embeddings() -> Embeddings:
+    fallback = LocalHashEmbeddings()
+    if config.EMBEDDING_BACKEND.lower() == "local" or not config.DASHSCOPE_API_KEY:
+        return fallback
+    remote = OpenAIEmbeddings(
         model=config.EMBEDDING_MODEL, api_key=config.DASHSCOPE_API_KEY,
         base_url=config.QWEN_BASE_URL, check_embedding_ctx_length=False,
         chunk_size=8,   # text-embedding-v4 单批上限10，留余量设8
     )
+    return ResilientEmbeddings(remote, fallback, config.EMBEDDING_MODEL)
 
 
 # ── 博查搜索 ──────────────────────────────────────────────────────────────────

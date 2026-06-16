@@ -37,6 +37,7 @@ def _env_bool(name: str, default: bool = True) -> bool:
 DASHSCOPE_API_KEY = _env_value("DASHSCOPE_API_KEY")
 QWEN_MODEL        = _env_value("QWEN_MODEL", "qwen-plus")
 EMBEDDING_MODEL   = _env_value("EMBEDDING_MODEL", "text-embedding-v4")
+EMBEDDING_BACKEND = _env_value("EMBEDDING_BACKEND", "dashscope")
 QWEN_BASE_URL     = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 OPENAI_API_KEY = _env_value("OPENAI_API_KEY")

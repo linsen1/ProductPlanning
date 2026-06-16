@@ -49,7 +49,10 @@ DASHSCOPE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
 BOCHA_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
 QWEN_MODEL = "qwen3-235b-a22b"
 EMBEDDING_MODEL = "text-embedding-v4"
+EMBEDDING_BACKEND = "local"
 ```
+
+如果 DashScope 账号已开通 embedding 模型权限，可以把 `EMBEDDING_BACKEND` 改成 `"dashscope"`；未开通时保持 `"local"`，系统会使用本地关键词向量重建知识库。
 
 ## 知识库管理
 
