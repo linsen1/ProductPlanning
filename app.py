@@ -1303,9 +1303,52 @@ def _parse_usp_options(analysis: str) -> list[dict]:
     return deduped
 
 
+def _repair_compact_markdown_tables(text: str) -> str:
+    """Repair model output that collapses an entire Markdown table into one line."""
+    import re
+
+    fixed_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("|") and "||" in stripped and stripped.count("|") >= 8):
+            fixed_lines.append(line)
+            continue
+
+        parts = re.split(r"\|\s*\|", stripped)
+        rows: list[str] = []
+        for i, part in enumerate(parts):
+            row = part.strip()
+            if i > 0 and not row.startswith("|"):
+                row = "|" + row
+            if not row.endswith("|"):
+                row += "|"
+            row = re.sub(r"<br\s*/?>", "；", row, flags=re.IGNORECASE)
+            rows.append(row)
+
+        if len(rows) >= 2:
+            header_cols = _split_row(rows[0])
+            sep_cols = _split_row(rows[1])
+            if header_cols and _is_table_sep(sep_cols):
+                rows[1] = "|" + "|".join("---" for _ in header_cols) + "|"
+        fixed_lines.extend(rows)
+
+    return "\n".join(fixed_lines)
+
+
+def _normalize_plan_markdown(plan: str) -> str:
+    plan = _repair_compact_markdown_tables(plan or "")
+    normalized: list[str] = []
+    for line in plan.splitlines():
+        if line.strip().startswith("|"):
+            normalized.append(re.sub(r"<br\s*/?>", "；", line, flags=re.IGNORECASE))
+        else:
+            normalized.append(re.sub(r"<br\s*/?>", "\n", line, flags=re.IGNORECASE))
+    return "\n".join(normalized).strip()
+
+
 def render_plan_result(plan_result: dict, product_name: str):
     """渲染第三步：完整产品策划方案"""
-    plan  = plan_result.get("product_plan", "")
+    plan  = _normalize_plan_markdown(plan_result.get("product_plan", ""))
     cases = plan_result.get("retrieved_cases", [])
 
     st.divider()
