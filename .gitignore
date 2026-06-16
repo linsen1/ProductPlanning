@@ -1,0 +1,24 @@
+.DS_Store
+
+# Local environment
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Streamlit local secrets
+.streamlit/secrets.toml
+
+# Generated local vector index
+chroma_db/
