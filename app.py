@@ -11,6 +11,8 @@ import os
 import json
 import re
 import requests
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Dict, List, TypedDict, Optional
 
@@ -236,8 +238,33 @@ def bocha_ai_search(query: str, count: int = None) -> tuple[str, list[dict]]:
 
 
 # ── 向量库管理 ────────────────────────────────────────────────────────────────
+def _is_streamlit_cloud() -> bool:
+    cwd = Path.cwd().resolve()
+    return str(cwd).startswith("/mount/src") or bool(os.getenv("STREAMLIT_SHARING_MODE"))
+
+
+def _vectorstore_persistent_enabled() -> bool:
+    mode = config.VECTOR_DB_MODE.lower()
+    if mode in ("memory", "in-memory", "ephemeral"):
+        return False
+    if mode in ("persistent", "persist", "disk"):
+        return True
+    return not _is_streamlit_cloud()
+
+
+def _vector_db_path() -> Path:
+    path = Path(config.DB_DIR)
+    if _is_streamlit_cloud() and not path.is_absolute():
+        return Path(tempfile.gettempdir()) / "projectai" / path.name
+    return path
+
+
+def _memory_collection_name() -> str:
+    return f"projectai-kb-{uuid.uuid4().hex[:16]}"
+
+
 def _kb_manifest_path() -> Path:
-    return Path(config.DB_DIR) / "kb_manifest.json"
+    return _vector_db_path() / "kb_manifest.json"
 
 def _kb_manifest() -> list[dict]:
     kb_root = Path(config.KB_DIR)
@@ -317,21 +344,46 @@ def build_vectorstore():
         return None, 0, 0
     splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
     splits = splitter.split_documents(docs)
-    vs = Chroma.from_documents(splits, embedding=get_embeddings(), persist_directory=config.DB_DIR)
-    _save_kb_manifest(_kb_manifest())
+    persist = _vectorstore_persistent_enabled()
+    try:
+        if persist:
+            _vector_db_path().mkdir(parents=True, exist_ok=True)
+            vs = Chroma.from_documents(
+                splits,
+                embedding=get_embeddings(),
+                persist_directory=str(_vector_db_path()),
+            )
+            _save_kb_manifest(_kb_manifest())
+        else:
+            vs = Chroma.from_documents(
+                splits,
+                embedding=get_embeddings(),
+                collection_name=_memory_collection_name(),
+            )
+    except Exception as exc:
+        if not persist:
+            raise
+        reset_vectorstore()
+        st.warning(f"持久化向量库初始化失败，已自动切换到内存向量库。原始错误：{str(exc)[:220]}")
+        vs = Chroma.from_documents(
+            splits,
+            embedding=get_embeddings(),
+            collection_name=_memory_collection_name(),
+        )
     return vs, len(docs), len(splits)
 
 def load_vectorstore():
-    return Chroma(persist_directory=config.DB_DIR, embedding_function=get_embeddings())
+    return Chroma(persist_directory=str(_vector_db_path()), embedding_function=get_embeddings())
 
 def reset_vectorstore():
     import shutil
-    if os.path.exists(config.DB_DIR):
-        shutil.rmtree(config.DB_DIR, ignore_errors=True)
+    db_path = _vector_db_path()
+    if db_path.exists():
+        shutil.rmtree(db_path, ignore_errors=True)
 
 def _persisted_count() -> int:
     import sqlite3
-    db = Path(config.DB_DIR) / "chroma.sqlite3"
+    db = _vector_db_path() / "chroma.sqlite3"
     if not db.exists(): return 0
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -344,9 +396,11 @@ def _persisted_count() -> int:
 
 @st.cache_resource(show_spinner="📚 加载产品案例知识库...")
 def ensure_vectorstore(manifest_key: str):
+    if not _vectorstore_persistent_enabled():
+        return build_vectorstore()
     if (
-        not os.path.exists(config.DB_DIR)
-        or not os.listdir(config.DB_DIR)
+        not _vector_db_path().exists()
+        or not os.listdir(_vector_db_path())
         or _persisted_count() == 0
         or _kb_manifest_changed()
     ):

@@ -57,6 +57,7 @@ BOCHA_USE_AISEARCH = _env_bool("BOCHA_USE_AISEARCH")
 
 # ── 知识库配置 ────────────────────────────────────────────────────────────────
 DB_DIR = _env_value("VECTOR_DB_DIR", "./chroma_db")
+VECTOR_DB_MODE = _env_value("VECTOR_DB_MODE", "auto")
 KB_DIR = _env_value("KB_DIR", "./data")
 TOP_K  = _env_int("TOP_K", 3)
 

@@ -50,9 +50,11 @@ BOCHA_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
 QWEN_MODEL = "qwen3-235b-a22b"
 EMBEDDING_MODEL = "text-embedding-v4"
 EMBEDDING_BACKEND = "local"
+VECTOR_DB_MODE = "auto"
 ```
 
 如果 DashScope 账号已开通 embedding 模型权限，可以把 `EMBEDDING_BACKEND` 改成 `"dashscope"`；未开通时保持 `"local"`，系统会使用本地关键词向量重建知识库。
+`VECTOR_DB_MODE = "auto"` 会在 Streamlit Cloud 使用内存向量库，避免云端持久化目录残留或损坏导致 Chroma 初始化失败。
 
 ## 知识库管理
 
