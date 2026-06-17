@@ -8,6 +8,10 @@ langchain-chroma>=1.1,<1.2
 chromadb>=1.5,<1.6
 agno>=2.6,<2.7
 
+# PDF 导出（中文用 reportlab 内置 CID 字体 STSong-Light，无需外部字体文件）
+xhtml2pdf>=0.2.16
+reportlab>=4.0
+
 # Keep Chroma's telemetry/protobuf stack on mutually compatible generated code.
 opentelemetry-api>=1.34,<2
 opentelemetry-sdk>=1.34,<2

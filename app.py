@@ -35,6 +35,7 @@ from agno.agent import Agent
 from agno.models.dashscope import DashScope
 
 import config
+from refine_engine import VersionStore, parse_intent, apply_refinement, get_proactive_suggestions, splice_section_into_plan
 from prompts import (
     STRATEGY_PROMPT,
     PRODUCT_PLAN_PROMPT,
@@ -797,7 +798,8 @@ def export_to_word(product_name: str, content: str) -> Optional[bytes]:
         def _fill_cell(cell, text, header=False):
             cell.text = ""
             p = cell.paragraphs[0]
-            for k, seg in enumerate(text.split("<br>")):
+            segs = re.split(r"<br\s*/?>", text, flags=re.IGNORECASE)
+            for k, seg in enumerate(segs):
                 if k > 0:
                     p.add_run().add_break()
                 _md_inline_runs(p, seg.strip())
@@ -902,6 +904,112 @@ def export_to_word(product_name: str, content: str) -> Optional[bytes]:
         doc.save(buf)
         return buf.getvalue()
     except ImportError:
+        return None
+
+
+# ── PDF 导出 ─────────────────────────────────────────────────────────────────
+def export_to_pdf(product_name: str, content: str) -> Optional[bytes]:
+    """将方案导出为 PDF（依赖 xhtml2pdf，未安装时返回 None）"""
+    try:
+        from xhtml2pdf import pisa
+        import io as _io
+
+        # 注册中文字体（reportlab 内置 CID 字体，无需外部字体文件，跨平台可用）。
+        # 不注册的话 xhtml2pdf 默认 Helvetica 不含中文字形，中文会变成空白方块。
+        try:
+            from reportlab.pdfbase import pdfmetrics as _pm
+            from reportlab.pdfbase.cidfonts import UnicodeCIDFont as _CID
+            if "STSong-Light" not in _pm.getRegisteredFontNames():
+                _pm.registerFont(_CID("STSong-Light"))
+        except Exception:
+            pass
+
+        # 生成针对 PDF 优化的简化 HTML（不含 flex/grid/linear-gradient）
+        import datetime as _dt
+        import html as _html_lib
+        import re as _re
+
+        def _ei(t):
+            t = _html_lib.escape(t)
+            # 还原 <br>（转义后变成 &lt;br&gt;）为 reportlab 可识别的换行
+            t = _re.sub(r"&lt;br\s*/?&gt;", "<br/>", t, flags=_re.IGNORECASE)
+            t = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
+            t = _re.sub(r"\*([^*\n]+?)\*", r"<em>\1</em>", t)
+            return t
+
+        lines = content.split("\n")
+        i, n, first_h1 = 0, len(lines), False
+        body: list[str] = []
+        while i < n:
+            s = lines[i].strip()
+            if s.startswith("|"):
+                block = []
+                while i < n and lines[i].strip().startswith("|"):
+                    block.append(lines[i]); i += 1
+                rows = [c for c in (_split_row(b) for b in block) if not _is_table_sep(c)]
+                rows = [r for r in rows if r]
+                if rows:
+                    ncols = max(len(r) for r in rows)
+                    t = ["<table>"]
+                    for ri, r in enumerate(rows):
+                        tag = "th" if ri == 0 else "td"
+                        cells = "".join(
+                            f"<{tag}>{_ei(r[ci] if ci < len(r) else '')}</{tag}>"
+                            for ci in range(ncols)
+                        )
+                        t.append(f"<tr>{cells}</tr>")
+                    t.append("</table>"); body.append("".join(t))
+                continue
+            if not s: i += 1; continue
+            if s.startswith("# "):
+                if not first_h1: first_h1 = True; i += 1; continue
+                body.append(f"<h1>{_ei(s[2:])}</h1>")
+            elif s.startswith("## "): body.append(f"<h2>{_ei(s[3:])}</h2>")
+            elif s.startswith("### "): body.append(f"<h3>{_ei(s[4:])}</h3>")
+            elif s.startswith("#### "): body.append(f"<h4>{_ei(s[5:])}</h4>")
+            elif s.startswith(("- ", "* ")):
+                items = []
+                while i < n and lines[i].strip().startswith(("- ", "* ")):
+                    items.append(lines[i].strip()[2:]); i += 1
+                body.append("<ul>" + "".join(f"<li>{_ei(it)}</li>" for it in items) + "</ul>")
+                continue
+            elif s.startswith("> "): body.append(f"<blockquote>{_ei(s[2:])}</blockquote>")
+            elif s not in ("---",): body.append(f"<p>{_ei(s)}</p>")
+            i += 1
+
+        css = """
+        body{font-family:'STSong-Light';font-size:10pt;color:#222;margin:20px;}
+        *{font-family:'STSong-Light';}
+        h1{font-size:16pt;color:#C8102E;border-bottom:1pt solid #C8102E;margin-top:18pt;}
+        h2{font-size:13pt;color:#C8102E;background:#f8e8e8;padding:4pt 8pt;margin-top:14pt;}
+        h3{font-size:11pt;color:#C8102E;margin-top:10pt;}
+        h4{font-size:10pt;font-weight:bold;margin-top:8pt;}
+        p{margin:4pt 0;line-height:1.5;}
+        ul{margin:4pt 0 4pt 16pt;}
+        li{margin:2pt 0;}
+        table{border-collapse:collapse;width:100%;margin:8pt 0;font-size:9pt;}
+        th{background:#C8102E;color:#fff;font-weight:bold;padding:4pt 6pt;border:0.5pt solid #C8102E;}
+        td{padding:4pt 6pt;border:0.5pt solid #ccc;vertical-align:top;}
+        tr:nth-child(even) td{background:#fafafa;}
+        blockquote{margin:6pt 0;padding:4pt 10pt;border-left:3pt solid #C8102E;color:#555;font-style:italic;}
+        """
+        date_str = _dt.date.today().strftime("%Y年%m月")
+        html_str = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            f"<style>{css}</style></head><body>"
+            f"<h1 style='font-size:20pt;text-align:center'>{_html_lib.escape(product_name)}</h1>"
+            f"<p style='text-align:center;color:#888'>优路教育 · {date_str}</p><hr/>"
+            + "".join(body)
+            + "</body></html>"
+        )
+        buf = _io.BytesIO()
+        result = pisa.CreatePDF(html_str.encode("utf-8"), dest=buf, encoding="utf-8")
+        if not result.err:
+            return buf.getvalue()
+        return None
+    except ImportError:
+        return None
+    except Exception:
         return None
 
 
@@ -1346,6 +1454,12 @@ def _normalize_plan_markdown(plan: str) -> str:
     return "\n".join(normalized).strip()
 
 
+def md_plan(text: str):
+    """渲染方案 Markdown。开启 unsafe_allow_html，让表格单元格里的 <br> 正常换行
+    （Markdown 表格无法用真实换行，<br> 是唯一写法，默认不开 HTML 会原样显示）。"""
+    st.markdown(text or "", unsafe_allow_html=True)
+
+
 def render_plan_result(plan_result: dict, product_name: str):
     """渲染第三步：完整产品策划方案"""
     plan  = _normalize_plan_markdown(plan_result.get("product_plan", ""))
@@ -1374,56 +1488,75 @@ def render_plan_result(plan_result: dict, product_name: str):
     ])
 
     with tabs[0]:
-        st.markdown(plan)
+        md_plan(plan)
         st.divider()
-        dl1, dl2, dl3 = st.columns(3)
+        dl1, dl2, dl3, dl4 = st.columns(4)
         with dl1:
-            st.download_button("⬇️ 下载 Markdown", data=plan.encode("utf-8"),
+            st.download_button("⬇️ Markdown", data=plan.encode("utf-8"),
                 file_name=f"{product_name}_产品策划方案.md", mime="text/markdown",
                 use_container_width=True)
         with dl2:
             word_bytes = export_to_word(product_name, plan)
             if word_bytes:
-                st.download_button("⬇️ 下载 Word 文档", data=word_bytes,
+                st.download_button("⬇️ Word 文档", data=word_bytes,
                     file_name=f"{product_name}_产品策划方案.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     use_container_width=True, type="primary")
         with dl3:
             html_str = export_to_html(product_name, plan)
-            st.download_button("⬇️ 下载 HTML 预览", data=html_str.encode("utf-8"),
+            st.download_button("⬇️ HTML 预览", data=html_str.encode("utf-8"),
                 file_name=f"{product_name}_产品策划方案.html", mime="text/html",
                 use_container_width=True)
+        with dl4:
+            pdf_bytes = export_to_pdf(product_name, plan)
+            if pdf_bytes:
+                st.download_button("⬇️ PDF", data=pdf_bytes,
+                    file_name=f"{product_name}_产品策划方案.pdf", mime="application/pdf",
+                    use_container_width=True)
+            else:
+                st.caption("PDF 需安装依赖：`pip install -r requirements.txt` 后重启应用")
+        st.divider()
+        if st.button("✏️ 进入对话精修模式", type="primary", use_container_width=True,
+                     help="生成初稿后，通过对话逐步调整，支持版本回滚"):
+            # 不要清空版本历史！返回后再次进入应保留多轮修改记录。
+            # 仅当还没有任何版本（首次进入）时，由 render_refine_mode 自动以初稿建第1版。
+            # 版本历史的重置只在「换个方向重新生成 / 新建策划方案」时发生。
+            vs = VersionStore()
+            if vs.count() == 0:
+                vs.push(plan, "AI初稿")
+            st.session_state["phase"] = "refine"
+            st.rerun()
         with st.expander("👁️ HTML 预览（卡片版观感）", expanded=False):
             components.html(export_to_html(product_name, plan), height=600, scrolling=True)
 
     sections = _extract_sections(plan)
     with tabs[1]:
         st.markdown("### 主卖点 Slogan 候选")
-        st.markdown(sections.get("slogan", "_请查看完整方案_"))
+        md_plan(sections.get("slogan", "_请查看完整方案_"))
     with tabs[2]:
         st.markdown("### 产品背景")
-        st.markdown(sections.get("background", "_请查看完整方案_"))
+        md_plan(sections.get("background", "_请查看完整方案_"))
     with tabs[3]:
         st.markdown("### 适合人群分析")
-        st.markdown(sections.get("audience", "_请查看完整方案_"))
+        md_plan(sections.get("audience", "_请查看完整方案_"))
     with tabs[4]:
         st.markdown("### 产品优势")
-        st.markdown(sections.get("advantage", "_请查看完整方案_"))
+        md_plan(sections.get("advantage", "_请查看完整方案_"))
     with tabs[5]:
         st.markdown("### 产品简章")
-        st.markdown(sections.get("brief", "_请查看完整方案_"))
+        md_plan(sections.get("brief", "_请查看完整方案_"))
     with tabs[6]:
         st.markdown("### 师资介绍")
-        st.markdown(sections.get("teachers", "_请查看完整方案_"))
+        md_plan(sections.get("teachers", "_请查看完整方案_"))
     with tabs[7]:
         st.markdown("### 课程说明")
-        st.markdown(sections.get("course", "_请查看完整方案_"))
+        md_plan(sections.get("course", "_请查看完整方案_"))
     with tabs[8]:
         st.markdown("### 产介话术")
-        st.markdown(sections.get("pitch", "_请查看完整方案_"))
+        md_plan(sections.get("pitch", "_请查看完整方案_"))
     with tabs[9]:
         st.markdown("### 产品搭建整体思路")
-        st.markdown(sections.get("build_logic", "_请查看完整方案_"))
+        md_plan(sections.get("build_logic", "_请查看完整方案_"))
     with tabs[10]:
         if cases:
             for i, doc in enumerate(cases, 1):
@@ -1435,32 +1568,441 @@ def render_plan_result(plan_result: dict, product_name: str):
 
 def _extract_sections(plan: str) -> dict:
     """
-    从 AI 生成的方案文本中提取各章节内容。
-    对应 PRODUCT_PLAN_PROMPT 的 9 章节结构。
+    从 AI 生成的方案文本中提取各章节内容，对应 9 个分栏标签。
+
+    用「关键词命中实际 ## 标题」来定位，而不是死板匹配 "## 一、产品背景" 这种
+    固定格式——这样无论标题带不带编号（一、/1./4.）、带不带证书前缀
+    （【公共营养师】产品简章）都能识别。多证书方案里同名章节会重复出现，
+    这里把所有命中的同类章节按出现顺序拼接，避免漏掉。
     """
-    import re
-    sections = {}
-    # 匹配模式：支持"## 主卖点 Slogan"（顶部无编号）以及"## 一、"…"## 八、"带编号格式
-    markers = {
-        "slogan":      r"##\s*主卖点\s*Slogan",
-        "background":  r"##\s*[一1][、.]\s*产品背景",
-        "audience":    r"##\s*[二2][、.]\s*适合人群",
-        "advantage":   r"##\s*[三3][、.]\s*产品优势",
-        "brief":       r"##\s*[四4][、.]\s*产品简章",
-        "teachers":    r"##\s*[五5][、.]\s*师资介绍",
-        "course":      r"##\s*[六6][、.]\s*课程说明",
-        "pitch":       r"##\s*[七7][、.]\s*产介话术",
-        "build_logic": r"##\s*[八8][、.]\s*产品搭建",
+    # 每个 key 的候选关键词（命中标题即算）
+    keymap = {
+        "slogan":      ["slogan", "主卖点"],
+        "background":  ["产品背景", "背景"],
+        "audience":    ["适合人群", "目标人群", "人群"],
+        "advantage":   ["产品优势", "核心优势", "优势"],
+        "brief":       ["产品简章", "招生简章", "简章"],
+        "teachers":    ["师资"],
+        "course":      ["课程说明", "课程体系", "课程"],
+        "pitch":       ["产介话术", "话术", "销售话术"],
+        "build_logic": ["产品搭建", "搭建思路", "搭建", "整体思路"],
     }
-    keys      = list(markers.keys())
-    positions = [m.start() if (m := re.search(p, plan, re.IGNORECASE)) else -1
-                 for p in markers.values()]
-    for i, (key, pos) in enumerate(zip(keys, positions)):
-        if pos == -1:
-            continue
-        next_pos = next((p for p in positions[i+1:] if p > pos), len(plan))
-        sections[key] = plan[pos:next_pos].strip()
+    chapters = _split_plan_sections(plan)  # [{title, content}, ...]，按真实标题切分
+
+    sections: dict = {}
+    for key, kws in keymap.items():
+        hits = [c["content"] for c in chapters
+                if any(kw.lower() in c["title"].lower() for kw in kws)]
+        if hits:
+            sections[key] = "\n\n".join(hits).strip()
     return sections
+
+
+# ── 对话精修模式 ──────────────────────────────────────────────────────────────
+def _split_plan_sections(plan: str) -> list[dict]:
+    """把方案按 ## 标题拆成有序章节列表，返回 [{title, content}, ...]"""
+    lines = plan.split("\n")
+    sections: list[dict] = []
+    cur_title = ""
+    cur_lines: list[str] = []
+    for line in lines:
+        m = re.match(r"^(#{1,2})\s+(.+)", line)
+        if m:
+            if cur_lines:
+                sections.append({"title": cur_title or "（前言）",
+                                  "content": "\n".join(cur_lines).strip()})
+            cur_title = m.group(2).strip()
+            cur_lines = [line]
+        else:
+            cur_lines.append(line)
+    if cur_lines:
+        sections.append({"title": cur_title or "（结尾）",
+                          "content": "\n".join(cur_lines).strip()})
+    return [s for s in sections if s["content"].strip()]
+
+
+def _extract_chapters_for_refine(plan: str) -> list[dict]:
+    """把方案 Markdown 按 ## 标题拆成章节列表，用于左侧导航"""
+    chapters: list[dict] = [{"title": "📋 完整方案", "key": "__full__", "content": plan}]
+    lines = plan.split("\n")
+    cur_title: str | None = None
+    cur_start = 0
+    for i, line in enumerate(lines):
+        if re.match(r"^## ", line.strip()):
+            if cur_title is not None:
+                chapters.append({
+                    "title": cur_title,
+                    "key": cur_title,
+                    "content": "\n".join(lines[cur_start:i]).strip(),
+                })
+            cur_title = line.strip()[3:].strip()
+            cur_start = i
+    if cur_title is not None:
+        chapters.append({
+            "title": cur_title,
+            "key": cur_title,
+            "content": "\n".join(lines[cur_start:]).strip(),
+        })
+    return chapters
+
+
+def _do_refine(vs: "VersionStore", user_message: str,
+               section_title: str, section_key: str, current_plan: str):
+    """
+    统一精修执行入口：解析意图 → 执行修改 → 存档版本 → 追加对话记录。
+    被快捷操作按钮和自定义指令共享。
+    """
+    llm = get_llm(0.4)
+
+    if section_key != "__full__":
+        # 已明确选中章节，跳过意图解析，直接用 local scope
+        intent: dict = {
+            "scope": "local", "type": "text",
+            "section": section_title,
+            "has_ambiguity": False, "clarification": None,
+            "is_rollback": False, "rollback_to": None,
+            "is_finalize": False, "proactive_note": None,
+        }
+    else:
+        # 全文操作，走意图解析
+        intent = parse_intent(user_message, current_plan, llm)
+
+    # 回滚
+    if intent.get("is_rollback") and intent.get("rollback_to"):
+        target = int(intent["rollback_to"])
+        content = vs.rollback(target)
+        reply = (f"✅ 已回滚到第 {target} 版" if content
+                 else f"❌ 找不到第 {target} 版（当前共 {vs.count()} 版）")
+        st.session_state["refine_chat"].append({"role": "assistant", "content": reply})
+        return
+
+    # 定稿
+    if intent.get("is_finalize"):
+        st.session_state["refine_chat"].append({
+            "role": "assistant",
+            "content": f"✅ 方案已定稿！第 {vs.current_num()} 版，请用顶部按钮导出。",
+        })
+        return
+
+    # 澄清（仅全文操作时触发）
+    if intent.get("has_ambiguity") and intent.get("clarification") and section_key == "__full__":
+        reply = f"请确认一下：{intent['clarification']}"
+        if intent.get("proactive_note"):
+            reply += f"\n\n💡 {intent['proactive_note']}"
+        st.session_state["refine_chat"].append({"role": "assistant", "content": reply})
+        return
+
+    # 执行修改
+    new_content, desc = apply_refinement(user_message, current_plan, intent, llm)
+    new_ver = vs.push(new_content, desc)
+
+    scope_label = f"「{section_title}」" if section_key != "__full__" else "全文"
+    reply = f"✅ 已完成 {scope_label} 修改，保存为第 {new_ver} 版"
+    if intent.get("proactive_note"):
+        reply += f"\n\n💡 {intent['proactive_note']}"
+    st.session_state["refine_chat"].append({"role": "assistant", "content": reply})
+
+
+def render_refine_mode():
+    """
+    三栏精修界面：
+    - 左（1）：章节导航竖排
+    - 中（3）：内容预览（大区域）
+    - 右（2）：已选章节标签 + 快捷动作 + 对话历史 + 自定义输入 + 版本行
+    """
+    form_inputs = st.session_state.get("form_inputs", {})
+    product_name = form_inputs.get("product_name", "产品方案")
+
+    vs = VersionStore()
+    if vs.count() == 0:
+        plan_result = st.session_state.get("plan_result", {})
+        original = _normalize_plan_markdown(plan_result.get("product_plan", ""))
+        vs.push(original, "AI初稿")
+
+    current_plan = vs.current() or ""
+    sections = _split_plan_sections(current_plan)
+    tab_titles = ["📋 完整方案"] + [s["title"] for s in sections]
+
+    # ── 初始化 session state ──────────────────────────────────────────────────
+    if "refine_chat" not in st.session_state:
+        st.session_state["refine_chat"] = []
+        with st.spinner("AI 扫描初稿，提出优化建议..."):
+            suggestions = get_proactive_suggestions(current_plan, get_llm(0.3))
+        intro = "方案初稿已就绪！扫描了一遍，找到几个可以优化的点：\n\n"
+        intro += suggestions if suggestions else "• 整体结构完整，可以开始精修"
+        intro += "\n\n顶部选中章节后，点右侧快捷按钮一键操作；也可以直接输入自定义需求。"
+        st.session_state["refine_chat"].append({"role": "assistant", "content": intro})
+    if "refine_tab" not in st.session_state:
+        st.session_state["refine_tab"] = "📋 完整方案"
+    if "refine_input_ctr" not in st.session_state:
+        st.session_state["refine_input_ctr"] = 0
+    if "refine_edit_mode" not in st.session_state:
+        st.session_state["refine_edit_mode"] = False
+
+    # ── 处理快捷动作（上一轮 rerun 挂起的 pending action）────────────────────
+    if "refine_pending" in st.session_state:
+        pending = st.session_state.pop("refine_pending")
+        st.session_state["refine_chat"].append({"role": "user", "content": pending["msg"]})
+        with st.spinner(pending["msg"][:30] + "..."):
+            new_content, desc = apply_refinement(
+                pending["msg"], current_plan, pending["intent"], get_llm(0.4))
+        # 修改没生效（失败 / 守卫拦截）时，不存档无意义的新版本，直接如实反馈
+        if new_content == current_plan or desc.startswith(("修改失败", "修改未生效")):
+            st.session_state["refine_chat"].append({
+                "role": "assistant", "content": f"⚠️ {desc}"
+            })
+        else:
+            ver = vs.push(new_content, desc)
+            st.session_state["refine_chat"].append({
+                "role": "assistant",
+                "content": f"✅ 完成，已保存为第 {ver} 版（{desc}）"
+            })
+        st.rerun()
+
+    selected_tab = st.session_state.get("refine_tab", "📋 完整方案")
+    is_full = (selected_tab == "📋 完整方案")
+
+    # ── 顶部：标题 + 版本信息 + 导出按钮 ─────────────────────────────────────
+    title_col, export_col = st.columns([2, 3])
+    with title_col:
+        st.markdown(f"### ✏️ {product_name} · 精修")
+        st.caption(f"第 {vs.current_num()} 版 · 共 {vs.count()} 版")
+    with export_col:
+        e1, e2, e3, e4, e5 = st.columns(5)
+        with e1:
+            wb = export_to_word(product_name, current_plan)
+            st.download_button("📄 Word", data=wb or b"",
+                file_name=f"{product_name}_v{vs.current_num()}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True, disabled=not wb)
+        with e2:
+            pb = export_to_pdf(product_name, current_plan)
+            if pb:
+                st.download_button("📑 PDF", data=pb,
+                    file_name=f"{product_name}_v{vs.current_num()}.pdf",
+                    mime="application/pdf", use_container_width=True)
+            else:
+                st.button("📑 PDF", disabled=True, use_container_width=True,
+                          help="PDF 需安装依赖：pip install -r requirements.txt 后重启应用")
+        with e3:
+            st.download_button("📝 MD", data=current_plan.encode(),
+                file_name=f"{product_name}_v{vs.current_num()}.md",
+                mime="text/markdown", use_container_width=True)
+        with e4:
+            hb = export_to_html(product_name, current_plan)
+            st.download_button("🌐 HTML", data=hb.encode(),
+                file_name=f"{product_name}_v{vs.current_num()}.html",
+                mime="text/html", use_container_width=True)
+        with e5:
+            if st.button("↩️ 返回", use_container_width=True):
+                # 把最新精修版本同步回 plan_result，避免返回后丢失修改
+                latest = vs.current()
+                if latest and "plan_result" in st.session_state:
+                    st.session_state["plan_result"]["product_plan"] = latest
+                st.session_state["phase"] = "plan"
+                st.rerun()
+
+    st.divider()
+
+    # ── 顶部：章节导航（横向）────────────────────────────────────────────────
+    st.caption("📑 章节导航")
+    safe_index = tab_titles.index(selected_tab) if selected_tab in tab_titles else 0
+    chosen = st.radio(
+        "章节",
+        options=tab_titles,
+        index=safe_index,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="refine_tab_radio",
+    )
+    if chosen != selected_tab:
+        st.session_state["refine_tab"] = chosen
+        st.session_state["refine_edit_mode"] = False  # 切章节时退出编辑模式
+        selected_tab = chosen
+        is_full = (chosen == "📋 完整方案")
+
+    st.divider()
+
+    # ── 两栏：左=内容预览 | 右=聊天对话 ─────────────────────────────────────
+    PANEL_H = 620  # 面板固定高度，内部滚动，避免页面被无限拉长
+    content_col, chat_col = st.columns([3, 2])
+
+    # ── 左栏：预览 / 编辑 双模式 ─────────────────────────────────────────────
+    with content_col:
+        if is_full:
+            display_content = current_plan
+        else:
+            matched = [s for s in sections if s["title"] == selected_tab]
+            display_content = matched[0]["content"] if matched else current_plan
+
+        edit_mode = st.session_state.get("refine_edit_mode", False)
+
+        # 顶部工具栏
+        tool_c1, tool_c2, tool_c3 = st.columns([1, 1, 4])
+        with tool_c1:
+            toggle_label = "👁 预览" if edit_mode else "✏️ 编辑"
+            if st.button(toggle_label, use_container_width=True, key="btn_toggle_edit"):
+                st.session_state["refine_edit_mode"] = not edit_mode
+                st.rerun()
+
+        if edit_mode:
+            # 编辑模式：可输入的文本框（自带滚动）
+            edited_content = st.text_area(
+                "内容编辑",
+                value=display_content,
+                height=PANEL_H - 20,
+                label_visibility="collapsed",
+                key=f"content_edit_{selected_tab}",
+            )
+            content_changed = (edited_content != display_content)
+            with tool_c2:
+                if st.button("💾 保存", disabled=not content_changed,
+                             use_container_width=True, key="btn_save_edit"):
+                    if is_full:
+                        new_plan = edited_content
+                    else:
+                        new_plan = splice_section_into_plan(
+                            current_plan, selected_tab, edited_content)
+                    ver = vs.push(new_plan, f"手动编辑·{selected_tab[:8]}")
+                    st.session_state["refine_chat"].append({
+                        "role": "assistant",
+                        "content": f"✅ 手动编辑已保存为第 {ver} 版"
+                    })
+                    st.session_state["refine_edit_mode"] = False
+                    st.rerun()
+            with tool_c3:
+                if content_changed:
+                    st.caption("⚠️ 有未保存的修改")
+        else:
+            # 预览模式：渲染 Markdown，固定高度 + 内部滚动
+            with st.container(height=PANEL_H, border=True):
+                md_plan(display_content)
+
+    # ── 右栏：快捷动作 + 对话历史 + 输入 ──────────────────────────────────────
+    with chat_col:
+        # 已选章节标签
+        if is_full:
+            st.info("📋 全文模式 · 修改作用于整份方案", icon=None)
+        else:
+            st.info(f"📌 已选：**{selected_tab}** · 修改优先作用于此章节", icon=None)
+
+        # 快捷动作（3+2 两行排列，适配较窄的右栏）
+        qa_defs = [
+            ("改语气", "style",
+             lambda t, f: f"把「{t}」章节的语气改得更专业有力" if not f else "整体调整语气，使方案更有说服力"),
+            ("改数据", "data",
+             lambda t, f: f"检查并补充「{t}」章节中的具体数据和关键信息" if not f else "检查全文数据，补充或更正具体数字"),
+            ("精简",   "text",
+             lambda t, f: f"精简「{t}」章节，去掉冗余内容，保留核心" if not f else "精简全文，去冗余保核心"),
+            ("加强",   "text",
+             lambda t, f: f"加强「{t}」章节描述，增加具体细节和说服力" if not f else "全面加强方案描述，提升内容深度"),
+            ("全局优化","style",
+             lambda t, f: "对整份方案进行整体优化，提升质量和专业度"),
+        ]
+        row1_cols = st.columns(3)
+        row2_cols = st.columns(2)
+        all_qa_cols = list(row1_cols) + list(row2_cols)
+        for col, (label, qtype, msg_fn) in zip(all_qa_cols, qa_defs):
+            with col:
+                if st.button(label, key=f"qa_{label}", use_container_width=True):
+                    force_global = (label == "全局优化")
+                    msg = msg_fn(selected_tab, is_full or force_global)
+                    scope = "global" if (is_full or force_global) else "local"
+                    section = None if (is_full or force_global) else selected_tab
+                    st.session_state["refine_pending"] = {
+                        "msg": msg,
+                        "intent": {
+                            "scope": scope, "type": qtype, "section": section,
+                            "has_ambiguity": False, "is_rollback": False,
+                            "is_finalize": False, "proactive_note": None,
+                        },
+                    }
+                    st.rerun()
+
+        # 对话历史（固定高度 + 内部滚动，最新消息在底部）
+        with st.container(height=260, border=True):
+            for msg in st.session_state.get("refine_chat", []):
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+        # 版本历史（可折叠，含一键回滚按钮）
+        versions = vs.list_versions()
+        exp_label = f"📚 版本历史（共 {vs.count()} 版，当前 v{vs.current_num()}）"
+        with st.expander(exp_label, expanded=False):
+            for v in reversed(versions):
+                is_cur = (v["num"] == vs.current_num())
+                vc1, vc2 = st.columns([3, 1])
+                with vc1:
+                    marker = " **◀ 当前**" if is_cur else ""
+                    st.caption(f"**v{v['num']}** {v['ts']} — {v['description']}{marker}")
+                with vc2:
+                    if not is_cur:
+                        if st.button("回滚", key=f"rb_{v['num']}",
+                                     use_container_width=True):
+                            vs.rollback(v["num"])
+                            st.session_state["refine_chat"].append({
+                                "role": "assistant",
+                                "content": f"✅ 已回滚到第 {v['num']} 版（{v['description']}）"
+                            })
+                            st.rerun()
+
+        # 自定义输入
+        user_text = st.text_area(
+            "自定义指令",
+            label_visibility="collapsed",
+            placeholder="自由描述 · 例：把价格改成3980 / 加一段师资介绍",
+            key=f"ri_{st.session_state['refine_input_ctr']}",
+            height=68,
+        )
+        send_col, _ = st.columns([1, 1])
+        with send_col:
+            send_clicked = st.button("发送 ▶", type="primary", use_container_width=True)
+
+        if send_clicked and user_text.strip():
+            user_msg = user_text.strip()
+            st.session_state["refine_input_ctr"] += 1
+            st.session_state["refine_chat"].append({"role": "user", "content": user_msg})
+            llm = get_llm(0.4)
+            with st.spinner("解析并执行修改..."):
+                intent = parse_intent(user_msg, current_plan, llm)
+            # 定稿
+            if intent.get("is_finalize"):
+                st.session_state["refine_chat"].append({
+                    "role": "assistant",
+                    "content": f"✅ 已定稿！当前第 {vs.current_num()} 版，请用顶部按钮导出。"
+                })
+                st.rerun()
+            # 回滚
+            if intent.get("is_rollback") and intent.get("rollback_to"):
+                target = int(intent["rollback_to"])
+                result = vs.rollback(target)
+                reply = (f"✅ 已回滚到第 {target} 版。" if result
+                         else f"❌ 找不到第 {target} 版（共 {vs.count()} 版）")
+                st.session_state["refine_chat"].append({"role": "assistant", "content": reply})
+                st.rerun()
+            # 澄清
+            if intent.get("has_ambiguity") and intent.get("clarification"):
+                reply = f"请确认：{intent['clarification']}"
+                if intent.get("proactive_note"):
+                    reply += f"\n\n💡 {intent['proactive_note']}"
+                st.session_state["refine_chat"].append({"role": "assistant", "content": reply})
+                st.rerun()
+            # 如果选中了某章节，覆盖 intent scope
+            if not is_full and intent.get("scope") != "global":
+                intent["scope"] = "local"
+                if not intent.get("section"):
+                    intent["section"] = selected_tab
+            with st.spinner("修改中..."):
+                new_content, desc = apply_refinement(user_msg, current_plan, intent, llm)
+            if new_content == current_plan or desc.startswith(("修改失败", "修改未生效")):
+                reply = f"⚠️ {desc}"
+            else:
+                ver = vs.push(new_content, desc)
+                reply = f"✅ 已完成，保存为第 {ver} 版（{desc}）"
+                if intent.get("proactive_note"):
+                    reply += f"\n\n💡 {intent['proactive_note']}"
+            st.session_state["refine_chat"].append({"role": "assistant", "content": reply})
+            st.rerun()
 
 
 # ── 主程序 ────────────────────────────────────────────────────────────────────
@@ -1483,7 +2025,7 @@ def main():
     st.caption("两段式流程：竞品分析 → 选定位方向 → 生成完整策划方案")
 
     # ── 状态机驱动三个阶段 ──────────────────────────────────────────────────
-    phase = st.session_state.get("phase", "form")  # form | strategy | plan
+    phase = st.session_state.get("phase", "form")  # form | strategy | plan | refine
 
     # ─ 阶段1：填表 ─
     if phase == "form":
@@ -1528,13 +2070,20 @@ def main():
         with col1:
             if st.button("↩️ 换个方向重新生成", use_container_width=True):
                 st.session_state["phase"] = "strategy"
-                st.session_state.pop("plan_result", None)
+                # 换方向=新方案，清空旧版本历史与精修对话，避免串到新方案上
+                for k in ["plan_result", "plan_versions", "refine_chat"]:
+                    st.session_state.pop(k, None)
                 st.rerun()
         with col2:
             if st.button("🆕 新建策划方案", use_container_width=True):
-                for k in ["phase", "form_inputs", "strategy_result", "plan_result", "selected_usp_label"]:
+                for k in ["phase", "form_inputs", "strategy_result", "plan_result",
+                          "selected_usp_label", "refine_chat", "plan_versions"]:
                     st.session_state.pop(k, None)
                 st.rerun()
+
+    # ─ 阶段4：对话精修 ─
+    elif phase == "refine":
+        render_refine_mode()
 
 
 if __name__ == "__main__":
